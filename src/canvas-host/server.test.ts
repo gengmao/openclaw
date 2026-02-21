@@ -1,6 +1,6 @@
-import type { AddressInfo } from "node:net";
 import fs from "node:fs/promises";
 import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -9,6 +9,43 @@ import { rawDataToString } from "../infra/ws.js";
 import { defaultRuntime } from "../runtime.js";
 import { A2UI_PATH, CANVAS_HOST_PATH, CANVAS_WS_PATH, injectCanvasLiveReload } from "./a2ui.js";
 import { createCanvasHostHandler, startCanvasHost } from "./server.js";
+
+const chokidarMockState = vi.hoisted(() => ({
+  watchers: [] as Array<{
+    on: (event: string, cb: (...args: unknown[]) => void) => unknown;
+    close: () => Promise<void>;
+    __emit: (event: string, ...args: unknown[]) => void;
+  }>,
+}));
+
+// Tests: avoid chokidar polling/fsevents; trigger "all" events manually.
+vi.mock("chokidar", () => {
+  const createWatcher = () => {
+    const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+    const api = {
+      on: (event: string, cb: (...args: unknown[]) => void) => {
+        const list = handlers.get(event) ?? [];
+        list.push(cb);
+        handlers.set(event, list);
+        return api;
+      },
+      close: async () => {},
+      __emit: (event: string, ...args: unknown[]) => {
+        for (const cb of handlers.get(event) ?? []) {
+          cb(...args);
+        }
+      },
+    };
+    chokidarMockState.watchers.push(api);
+    return api;
+  };
+
+  const watch = () => createWatcher();
+  return {
+    default: { watch },
+    watch,
+  };
+});
 
 describe("canvas host", () => {
   const quietRuntime = {
@@ -90,7 +127,7 @@ describe("canvas host", () => {
     }
   });
 
-  it("serves canvas content from the mounted base path", async () => {
+  it("serves canvas content from the mounted base path and reuses handlers without double close", async () => {
     const dir = await createCaseDir();
     await fs.writeFile(path.join(dir, "index.html"), "<html><body>v1</body></html>", "utf8");
 
@@ -131,28 +168,15 @@ describe("canvas host", () => {
       const miss = await fetch(`http://127.0.0.1:${port}/`);
       expect(miss.status).toBe(404);
     } finally {
-      await handler.close();
       await new Promise<void>((resolve, reject) =>
         server.close((err) => (err ? reject(err) : resolve())),
       );
     }
-  });
-
-  it("reuses a handler without closing it twice", async () => {
-    const dir = await createCaseDir();
-    await fs.writeFile(path.join(dir, "index.html"), "<html><body>v1</body></html>", "utf8");
-
-    const handler = await createCanvasHostHandler({
-      runtime: quietRuntime,
-      rootDir: dir,
-      basePath: CANVAS_HOST_PATH,
-      allowInTests: true,
-    });
     const originalClose = handler.close;
     const closeSpy = vi.fn(async () => originalClose());
     handler.close = closeSpy;
 
-    const server = await startCanvasHost({
+    const hosted = await startCanvasHost({
       runtime: quietRuntime,
       handler,
       ownsHandler: false,
@@ -162,9 +186,9 @@ describe("canvas host", () => {
     });
 
     try {
-      expect(server.port).toBeGreaterThan(0);
+      expect(hosted.port).toBeGreaterThan(0);
     } finally {
-      await server.close();
+      await hosted.close();
       expect(closeSpy).not.toHaveBeenCalled();
       await originalClose();
     }
@@ -175,6 +199,7 @@ describe("canvas host", () => {
     const index = path.join(dir, "index.html");
     await fs.writeFile(index, "<html><body>v1</body></html>", "utf8");
 
+    const watcherStart = chokidarMockState.watchers.length;
     const server = await startCanvasHost({
       runtime: quietRuntime,
       rootDir: dir,
@@ -184,6 +209,9 @@ describe("canvas host", () => {
     });
 
     try {
+      const watcher = chokidarMockState.watchers[watcherStart];
+      expect(watcher).toBeTruthy();
+
       const res = await fetch(`http://127.0.0.1:${server.port}${CANVAS_HOST_PATH}/`);
       const html = await res.text();
       expect(res.status).toBe(200);
@@ -212,6 +240,7 @@ describe("canvas host", () => {
       });
 
       await fs.writeFile(index, "<html><body>v2</body></html>", "utf8");
+      watcher.__emit("all", "change", index);
       expect(await msg).toBe("reload");
       ws.close();
     } finally {
